@@ -1070,6 +1070,7 @@ DISSECTOR_SRC = \
 	packet-opsi.c		\
 	packet-optommp.c	\
 	packet-osc.c		\
+	packet-oscore.c		\
 	packet-osi-options.c	\
 	packet-osi.c		\
 	packet-ositp.c		\
