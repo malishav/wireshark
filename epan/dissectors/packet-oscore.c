@@ -16,6 +16,7 @@
 #include <config.h>
 
 #include <epan/packet.h>   /* Should be first Wireshark include (other than config.h) */
+#include <epan/proto_data.h>
 #include <epan/expert.h>   /* Include only as needed */
 #include <epan/uat.h>
 #include <epan/strutil.h>
@@ -25,7 +26,7 @@
 #include <wsutil/wsgcrypt.h>
 #include "packet-ssl-utils.h"
 #include "packet-ieee802154.h" /* We use CCM implementation available as part of 802.15.4 dissector */
-#include "packet-oscore.h"
+#include "packet-coap.h" /* packet-coap.h includes packet-oscore.h */
 
 /* Prototypes */
 static guint oscore_alg_get_key_len(cose_aead_alg_t);
@@ -45,10 +46,14 @@ void proto_reg_handoff_oscore(void);
 void proto_register_oscore(void);
 
 /* Initialize the protocol and registered fields */
-static int proto_oscore                 = -1;
+static int proto_oscore                             = -1;
+static int proto_coap                               = -1;
 
-static int hf_oscore_coap_data          = -1;
-static int hf_oscore_tag                = -1;
+static int hf_oscore_tag                            = -1;
+static int hf_oscore_nonce                          = -1;
+static int hf_oscore_key                            = -1;
+
+static COAP_COMMON_LIST_T(dissect_oscore_hf);
 
 static expert_field ei_oscore_key_id_not_found        = EI_INIT;
 static expert_field ei_oscore_partial_iv_not_found    = EI_INIT;
@@ -59,7 +64,7 @@ static expert_field ei_oscore_decrypt_error           = EI_INIT;
 static expert_field ei_oscore_cbc_mac_failed          = EI_INIT;
 
 /* Initialize the subtree pointers */
-static gint ett_oscore = -1;
+static gint ett_oscore                                = -1;
 
 /* UAT variables */
 static uat_t            *oscore_context_uat = NULL;
@@ -324,7 +329,8 @@ static oscore_context_t * oscore_find_context(oscore_info_t *info) {
 
     for (i = 0; i < num_oscore_contexts; i++) {
         if (oscore_contexts[i].sender_id_prefs && info->kid) {
-            if (memcmp(oscore_contexts[i].sender_id->data, info->kid, oscore_contexts[i].sender_id->len) == 0) {
+            if ((info->kid_len == oscore_contexts[i].sender_id->len) &&
+                    memcmp(oscore_contexts[i].sender_id->data, info->kid, info->kid_len) == 0) {
                 return &oscore_contexts[i];
             }
         }
@@ -466,10 +472,11 @@ oscore_decrypt_and_verify(tvbuff_t *tvb_ciphertext,
     guint8 external_aad_len = 0;
     guint8 aad[100]; /* FIXME dirty length */
     guint8 aad_len = 0;
+    guint8 *decryption_key;
     gint ciphertext_captured_len;
     gint ciphertext_reported_len;
     gchar *encrypt0 = "Encrypt0";
-    proto_item *tag_item = NULL;
+    proto_item *item = NULL;
 
     tag_len = oscore_alg_get_tag_len(context->algorithm);
 
@@ -493,8 +500,20 @@ oscore_decrypt_and_verify(tvbuff_t *tvb_ciphertext,
         tvb_memcpy(tvb_ciphertext, rx_tag, *offset + ciphertext_reported_len, tag_len);
     }
 
+    if (info->response) {
+        decryption_key = context->response_decryption_key->data;
+    } else {
+        decryption_key = context->request_decryption_key->data;
+    }
+
     /* Create nonce to use for decryption and authenticity check */
     oscore_create_nonce(nonce, context, info);
+
+    item = proto_tree_add_bytes(tree, hf_oscore_nonce, tvb_ciphertext, 0, 13, nonce);
+    PROTO_ITEM_SET_GENERATED(item);
+
+    item = proto_tree_add_bytes(tree, hf_oscore_key, tvb_ciphertext, 0, 16, decryption_key);
+    PROTO_ITEM_SET_GENERATED(item);
 
     /*
      * Create the CCM* initial block for decryption (Adata=0, M=0, counter=0).
@@ -514,7 +533,7 @@ oscore_decrypt_and_verify(tvbuff_t *tvb_ciphertext,
      * Perform CTR-mode transformation and decrypt the tag.
      * FIXME: This only handles AES-CCM-16-64-128, add generic algorithm handling
      * */
-    if(ccm_ctr_encrypt(context->request_decryption_key->data, tmp, rx_tag, text, ciphertext_captured_len) == FALSE) {
+    if(ccm_ctr_encrypt(decryption_key, tmp, rx_tag, text, ciphertext_captured_len) == FALSE) {
         return STATUS_ERROR_DECRYPT_FAILED;
     }
 
@@ -554,7 +573,7 @@ oscore_decrypt_and_verify(tvbuff_t *tvb_ciphertext,
     * already points to contiguous memory, since we just allocated it in
     * decryption phase.
     */
-    if (!ccm_cbc_mac(context->request_decryption_key->data, tmp, aad, aad_len, tvb_get_ptr(*tvb_plaintext, 0, ciphertext_captured_len), ciphertext_captured_len, gen_tag)) {
+    if (!ccm_cbc_mac(decryption_key, tmp, aad, aad_len, tvb_get_ptr(*tvb_plaintext, 0, ciphertext_captured_len), ciphertext_captured_len, gen_tag)) {
         return STATUS_ERROR_CBCMAC_FAILED;
     }
     /* Compare the received tag with the one we generated. */
@@ -564,8 +583,8 @@ oscore_decrypt_and_verify(tvbuff_t *tvb_ciphertext,
 
     /* Display the tag. */
     if (tag_len) {
-        tag_item = proto_tree_add_bytes(tree, hf_oscore_tag, tvb_ciphertext, ciphertext_captured_len, tag_len, rx_tag);
-        PROTO_ITEM_SET_GENERATED(tag_item);
+        item = proto_tree_add_bytes(tree, hf_oscore_tag, tvb_ciphertext, ciphertext_captured_len, tag_len, rx_tag);
+        PROTO_ITEM_SET_GENERATED(item);
     }
 
     return STATUS_SUCCESS_DECRYPTION_TAG_CHECK;
@@ -580,11 +599,14 @@ oscore_dissect(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
     proto_item *ti;
     proto_tree *oscore_tree;
     /* Other misc. local variables. */
-    guint offset = 0;
-    oscore_info_t *info = data;
+    gint offset = 0;
+    oscore_info_t *info = (oscore_info_t *) data;
     oscore_context_t *context = NULL;
     oscore_decryption_status_t status;
     tvbuff_t *tvb_decrypted = NULL;
+    coap_info *coinfo;
+    gint oscore_length;
+    guint8 code_class;
 
     /* Check that the packet is long enough for it to belong to us. */
     if (tvb_reported_length(tvb) < OSCORE_MIN_LENGTH) {
@@ -635,7 +657,20 @@ oscore_dissect(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
 
     DISSECTOR_ASSERT(tvb_decrypted != NULL);
 
-    proto_tree_add_item(oscore_tree, hf_oscore_coap_data, tvb_decrypted, 0, tvb_reported_length(tvb_decrypted), ENC_NA);
+    oscore_length = tvb_reported_length(tvb_decrypted);
+
+    /* Fetch CoAP info */
+    coinfo = (coap_info *)p_get_proto_data(wmem_file_scope(), pinfo, proto_coap, 0);
+
+    /* TODO add expert info that OSCORE over HTTP is not supported */
+    DISSECTOR_ASSERT(coinfo != NULL);
+
+    dissect_coap_code(tvb_decrypted, oscore_tree, &offset, &dissect_oscore_hf, &code_class);
+    offset = dissect_coap_options(tvb_decrypted, pinfo, oscore_tree, offset, oscore_length, coinfo, &dissect_oscore_hf);
+
+    if (oscore_length > offset) {
+        dissect_coap_payload(tvb_decrypted, pinfo, oscore_tree, tree, offset, oscore_length, code_class, coinfo, &dissect_oscore_hf, TRUE);
+    }
 
     return tvb_captured_length(tvb);
 }
@@ -650,55 +685,67 @@ proto_register_oscore(void)
 {
     module_t        *oscore_module;
     expert_module_t *expert_oscore;
-    dissector_handle_t oscore_handle;
 
     static hf_register_info hf[] = {
-        { &hf_oscore_coap_data,
-          { "Decrypted CoAP Data", "oscore.coap_data",
-            FT_BYTES, BASE_NONE, NULL, 0x00,
-            NULL, HFILL }
-        },
         { &hf_oscore_tag,
           { "Decrypted Authentication Tag", "oscore.tag", FT_BYTES, BASE_NONE, NULL, 0x0,
             "Decrypted Authentication Tag", HFILL }
         },
+        { &hf_oscore_nonce,
+          { "OSCORE nonce", "oscore.nonce", FT_BYTES, BASE_NONE, NULL, 0x0,
+            "Nonce used for decryption", HFILL }
+        },
+        { &hf_oscore_key,
+          { "OSCORE decryption key", "oscore.key", FT_BYTES, BASE_NONE, NULL, 0x0,
+            "Decryption key", HFILL }
+        },
+        COAP_COMMON_HF_LIST(dissect_oscore_hf, "oscore")
     };
 
     /* Setup protocol subtree array */
     static gint *ett[] = {
-        &ett_oscore
+        &ett_oscore,
+        COAP_COMMON_ETT_LIST(dissect_oscore_hf)
     };
 
     /* Setup protocol expert items */
     static ei_register_info ei[] = {
         { &ei_oscore_key_id_not_found,
           { "oscore.key_id_not_found", PI_UNDECODED, PI_WARN,
-            "Key ID not found - can't decrypt", EXPFILL }
+            "Key ID not found - can't decrypt", EXPFILL
+          }
         },
         { &ei_oscore_partial_iv_not_found,
           { "oscore.partial_iv_not_found", PI_UNDECODED, PI_WARN,
-            "Partial IV not found - can't decrypt", EXPFILL }
+            "Partial IV not found - can't decrypt", EXPFILL
+          }
         },
         { &ei_oscore_context_not_set,
           { "oscore.context_not_set", PI_UNDECODED, PI_WARN,
-            "Security context not set - can't decrypt", EXPFILL }
+            "Security context not set - can't decrypt", EXPFILL
+          }
         },
         { &ei_oscore_message_too_small,
           { "oscore.message_too_small", PI_UNDECODED, PI_WARN,
-            "Message too small", EXPFILL }
+            "Message too small", EXPFILL
+          }
         },
         { &ei_oscore_cbc_mac_failed,
           { "oscore.cbc_mac_failed", PI_UNDECODED, PI_WARN,
-            "Call to CBC-MAC failed", EXPFILL }
+            "Call to CBC-MAC failed", EXPFILL
+          }
         },
         { &ei_oscore_tag_check_failed,
           { "oscore.tag_check_failed", PI_UNDECODED, PI_WARN,
-            "Authentication tag check failed", EXPFILL }
+            "Authentication tag check failed", EXPFILL
+          }
         },
         { &ei_oscore_decrypt_error,
           { "oscore.decrypt_error", PI_UNDECODED, PI_WARN,
-            "Decryption error", EXPFILL }
-        }
+            "Decryption error", EXPFILL
+          }
+        },
+        COAP_COMMON_EI_LIST(dissect_oscore_hf, "oscore")
     };
 
     static uat_field_t oscore_context_uat_flds[] = {
@@ -749,7 +796,9 @@ proto_register_oscore(void)
                 "Security context configuration data",
                 oscore_context_uat);
 
-    oscore_handle = register_dissector("oscore", oscore_dissect, proto_oscore);
+    register_dissector("oscore", oscore_dissect, proto_oscore);
+
+    proto_coap = proto_get_id_by_short_name("CoAP");
 }
 
 /*
